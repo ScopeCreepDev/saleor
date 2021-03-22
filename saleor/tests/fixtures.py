@@ -22,7 +22,7 @@ from django.test.utils import CaptureQueriesContext as BaseCaptureQueriesContext
 from django.utils import timezone
 from django_countries import countries
 from PIL import Image
-from prices import Money, TaxedMoney
+from prices import Money, TaxedMoney, fixed_discount
 
 from ..account.models import Address, StaffNotificationRecipient, User
 from ..app.models import App, AppInstallation
@@ -55,7 +55,11 @@ from ..giftcard.models import GiftCard
 from ..menu.models import Menu, MenuItem, MenuItemTranslation
 from ..order import OrderLineData, OrderStatus
 from ..order.actions import cancel_fulfillment, fulfill_order_lines
-from ..order.events import OrderEvents
+from ..order.events import (
+    OrderEvents,
+    draft_order_added_products_event,
+    fulfillment_refunded_event,
+)
 from ..order.models import FulfillmentStatus, Order, OrderEvent, OrderLine
 from ..order.utils import recalculate_order
 from ..page.models import Page, PageTranslation, PageType
@@ -64,6 +68,7 @@ from ..payment.interface import GatewayConfig, PaymentData
 from ..payment.models import Payment
 from ..plugins.models import PluginConfiguration
 from ..plugins.vatlayer.plugin import VatlayerPlugin
+from ..product import ProductMediaTypes
 from ..product.models import (
     Category,
     CategoryTranslation,
@@ -74,13 +79,13 @@ from ..product.models import (
     DigitalContentUrl,
     Product,
     ProductChannelListing,
-    ProductImage,
+    ProductMedia,
     ProductTranslation,
     ProductType,
     ProductVariant,
     ProductVariantChannelListing,
     ProductVariantTranslation,
-    VariantImage,
+    VariantMedia,
 )
 from ..product.tests.utils import create_image
 from ..shipping.models import (
@@ -712,6 +717,24 @@ def shipping_method(shipping_zone, channel_USD):
 
 
 @pytest.fixture
+def shipping_method_weight_based(shipping_zone, channel_USD):
+    method = ShippingMethod.objects.create(
+        name="weight based method",
+        type=ShippingMethodType.WEIGHT_BASED,
+        shipping_zone=shipping_zone,
+        maximum_delivery_days=10,
+        minimum_delivery_days=5,
+    )
+    ShippingMethodChannelListing.objects.create(
+        shipping_method=method,
+        channel=channel_USD,
+        minimum_order_price=Money(0, "USD"),
+        price=Money(10, "USD"),
+    )
+    return method
+
+
+@pytest.fixture
 def shipping_method_excluded_by_postal_code(shipping_method):
     shipping_method.postal_code_rules.create(start="HB2", end="HB6")
     return shipping_method
@@ -1311,6 +1334,67 @@ def product_with_variant_with_two_attributes(
 
 
 @pytest.fixture
+def product_with_variant_with_external_media(
+    color_attribute,
+    size_attribute,
+    category,
+    warehouse,
+    channel_USD,
+):
+    product_type = ProductType.objects.create(
+        name="Type with two variants",
+        slug="two-variants",
+        has_variants=True,
+        is_shipping_required=True,
+    )
+    product_type.variant_attributes.add(color_attribute)
+    product_type.variant_attributes.add(size_attribute)
+
+    product = Product.objects.create(
+        name="Test product with two variants",
+        slug="test-product-with-two-variant",
+        product_type=product_type,
+        category=category,
+    )
+    media_obj = ProductMedia.objects.create(
+        product=product,
+        external_url="https://www.youtube.com/watch?v=di8_dJ3Clyo",
+        alt="video_1",
+        type=ProductMediaTypes.VIDEO,
+        oembed_data="{}",
+    )
+    product.media.add(media_obj)
+
+    ProductChannelListing.objects.create(
+        product=product,
+        channel=channel_USD,
+        is_published=True,
+        currency=channel_USD.currency_code,
+        visible_in_listings=True,
+        available_for_purchase=datetime.date(1999, 1, 1),
+    )
+
+    variant = ProductVariant.objects.create(product=product, sku="prodVar1")
+    variant.media.add(media_obj)
+    ProductVariantChannelListing.objects.create(
+        variant=variant,
+        channel=channel_USD,
+        price_amount=Decimal(10),
+        cost_price_amount=Decimal(1),
+        currency=channel_USD.currency_code,
+    )
+
+    associate_attribute_values_to_instance(
+        variant, color_attribute, color_attribute.values.first()
+    )
+    associate_attribute_values_to_instance(
+        variant, size_attribute, size_attribute.values.first()
+    )
+
+    return product
+
+
+@pytest.fixture
 def product_with_variant_with_file_attribute(
     color_attribute, file_attribute, category, warehouse, channel_USD
 ):
@@ -1850,7 +1934,7 @@ def order_list(customer_user, channel_USD):
 
 @pytest.fixture
 def product_with_image(product, image, media_root):
-    ProductImage.objects.create(product=product, image=image)
+    ProductMedia.objects.create(product=product, image=image)
     return product
 
 
@@ -1924,8 +2008,8 @@ def product_with_images(product_type, category, media_root, channel_USD):
     file_mock_0.name = "image0.jpg"
     file_mock_1 = MagicMock(spec=File, name="FileMock1")
     file_mock_1.name = "image1.jpg"
-    product.images.create(image=file_mock_0)
-    product.images.create(image=file_mock_1)
+    product.media.create(image=file_mock_0)
+    product.media.create(image=file_mock_1)
     return product
 
 
@@ -2266,6 +2350,33 @@ def order_with_lines(
 
 
 @pytest.fixture
+def order_with_lines_and_events(order_with_lines, staff_user):
+    events = []
+    for event_type, _ in OrderEvents.CHOICES:
+        events.append(
+            OrderEvent(
+                type=event_type,
+                order=order_with_lines,
+                user=staff_user,
+            )
+        )
+    OrderEvent.objects.bulk_create(events)
+    fulfillment_refunded_event(
+        order=order_with_lines,
+        user=staff_user,
+        refunded_lines=[(1, order_with_lines.lines.first())],
+        amount=Decimal("10.0"),
+        shipping_costs_included=False,
+    )
+    draft_order_added_products_event(
+        order=order_with_lines,
+        user=staff_user,
+        order_lines=[(1, order_with_lines.lines.first())],
+    )
+    return order_with_lines
+
+
+@pytest.fixture
 def order_with_lines_channel_PLN(
     customer_user,
     product_type,
@@ -2511,6 +2622,22 @@ def draft_order(order_with_lines):
     order_with_lines.status = OrderStatus.DRAFT
     order_with_lines.save(update_fields=["status"])
     return order_with_lines
+
+
+@pytest.fixture
+def draft_order_with_fixed_discount_order(draft_order):
+    value = Decimal("20")
+    discount = partial(fixed_discount, discount=Money(value, draft_order.currency))
+    draft_order.undiscounted_total = draft_order.total
+    draft_order.total = discount(draft_order.total)
+    draft_order.discounts.create(
+        value_type=DiscountValueType.FIXED,
+        value=value,
+        reason="Discount reason",
+        amount=(draft_order.undiscounted_total - draft_order.total).gross,  # type: ignore
+    )
+    draft_order.save()
+    return draft_order
 
 
 @pytest.fixture
