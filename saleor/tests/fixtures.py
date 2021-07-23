@@ -73,6 +73,7 @@ from ..payment.models import Payment
 from ..plugins.manager import get_plugins_manager
 from ..plugins.models import PluginConfiguration
 from ..plugins.vatlayer.plugin import VatlayerPlugin
+from ..plugins.webhook.utils import to_payment_app_id
 from ..product import ProductMediaTypes
 from ..product.models import (
     Category,
@@ -103,7 +104,7 @@ from ..shipping.models import (
 from ..site.models import SiteSettings
 from ..warehouse.models import Allocation, Stock, Warehouse
 from ..webhook.event_types import WebhookEventType
-from ..webhook.models import Webhook
+from ..webhook.models import Webhook, WebhookEvent
 from ..wishlist.models import Wishlist
 from .utils import dummy_editorjs
 
@@ -704,6 +705,61 @@ def shipping_zones(db, channel_USD, channel_PLN):
 
 
 @pytest.fixture
+def shipping_zones_with_different_channels(db, channel_USD, channel_PLN):
+    shipping_zone_poland, shipping_zone_usa = ShippingZone.objects.bulk_create(
+        [
+            ShippingZone(name="Poland", countries=["PL"]),
+            ShippingZone(name="USA", countries=["US"]),
+        ]
+    )
+
+    shipping_zone_poland.channels.add(channel_PLN, channel_USD)
+    shipping_zone_usa.channels.add(channel_USD)
+
+    method = shipping_zone_poland.shipping_methods.create(
+        name="DHL",
+        type=ShippingMethodType.PRICE_BASED,
+        shipping_zone=shipping_zone,
+    )
+    second_method = shipping_zone_usa.shipping_methods.create(
+        name="DHL",
+        type=ShippingMethodType.PRICE_BASED,
+        shipping_zone=shipping_zone,
+    )
+    ShippingMethodChannelListing.objects.bulk_create(
+        [
+            ShippingMethodChannelListing(
+                channel=channel_USD,
+                shipping_method=method,
+                minimum_order_price=Money(0, "USD"),
+                price=Money(10, "USD"),
+                currency=channel_USD.currency_code,
+            ),
+            ShippingMethodChannelListing(
+                channel=channel_USD,
+                shipping_method=second_method,
+                minimum_order_price=Money(0, "USD"),
+                currency=channel_USD.currency_code,
+            ),
+            ShippingMethodChannelListing(
+                channel=channel_PLN,
+                shipping_method=method,
+                minimum_order_price=Money(0, "PLN"),
+                price=Money(40, "PLN"),
+                currency=channel_PLN.currency_code,
+            ),
+            ShippingMethodChannelListing(
+                channel=channel_PLN,
+                shipping_method=second_method,
+                minimum_order_price=Money(0, "PLN"),
+                currency=channel_PLN.currency_code,
+            ),
+        ]
+    )
+    return [shipping_zone_poland, shipping_zone_usa]
+
+
+@pytest.fixture
 def shipping_zone_without_countries(db, channel_USD):  # pylint: disable=W0613
     shipping_zone = ShippingZone.objects.create(name="Europe", countries=[])
     method = shipping_zone.shipping_methods.create(
@@ -795,6 +851,48 @@ def color_attribute(db):
 
 
 @pytest.fixture
+def attribute_choices_for_sorting(db):
+    attribute = Attribute.objects.create(
+        slug="sorting",
+        name="Sorting",
+        type=AttributeType.PRODUCT_TYPE,
+        filterable_in_storefront=True,
+        filterable_in_dashboard=True,
+        available_in_grid=True,
+    )
+    AttributeValue.objects.create(attribute=attribute, name="Global", slug="summer")
+    AttributeValue.objects.create(attribute=attribute, name="Apex", slug="zet")
+    AttributeValue.objects.create(attribute=attribute, name="Police", slug="absorb")
+    return attribute
+
+
+@pytest.fixture
+def boolean_attribute(db):
+    attribute = Attribute.objects.create(
+        slug="boolean",
+        name="Boolean",
+        type=AttributeType.PRODUCT_TYPE,
+        input_type=AttributeInputType.BOOLEAN,
+        filterable_in_storefront=True,
+        filterable_in_dashboard=True,
+        available_in_grid=True,
+    )
+    AttributeValue.objects.create(
+        attribute=attribute,
+        name=f"{attribute.name}: Yes",
+        slug=f"{attribute.id}_true",
+        boolean=True,
+    )
+    AttributeValue.objects.create(
+        attribute=attribute,
+        name=f"{attribute.name}: No",
+        slug=f"{attribute.id}_false",
+        boolean=False,
+    )
+    return attribute
+
+
+@pytest.fixture
 def rich_text_attribute(db):
     attribute = Attribute.objects.create(
         slug="text",
@@ -813,6 +911,26 @@ def rich_text_attribute(db):
         rich_text=dummy_editorjs(text),
     )
     return attribute
+
+
+@pytest.fixture
+def rich_text_attribute_with_many_values(rich_text_attribute):
+    attribute = rich_text_attribute
+    values = []
+    for i in range(5):
+        text = f"Rich text attribute content{i}."
+        values.append(
+            AttributeValue(
+                attribute=attribute,
+                name=truncatechars(
+                    clean_editor_js(dummy_editorjs(text), to_string=True), 50
+                ),
+                slug=f"instance_{attribute.id}_{i}",
+                rich_text=dummy_editorjs(text),
+            )
+        )
+    AttributeValue.objects.bulk_create(values)
+    return rich_text_attribute
 
 
 @pytest.fixture
@@ -2466,6 +2584,7 @@ def order_with_lines_and_events(order_with_lines, staff_user):
     fulfillment_refunded_event(
         order=order_with_lines,
         user=staff_user,
+        app=None,
         refunded_lines=[(1, order_with_lines.lines.first())],
         amount=Decimal("10.0"),
         shipping_costs_included=False,
@@ -2473,6 +2592,7 @@ def order_with_lines_and_events(order_with_lines, staff_user):
     order_added_products_event(
         order=order_with_lines,
         user=staff_user,
+        app=None,
         order_lines=[(1, order_with_lines.lines.first())],
     )
     return order_with_lines
@@ -2716,7 +2836,7 @@ def fulfilled_order_with_all_cancelled_fulfillments(
     fulfilled_order, staff_user, warehouse
 ):
     fulfillment = fulfilled_order.fulfillments.get()
-    cancel_fulfillment(fulfillment, staff_user, warehouse, get_plugins_manager())
+    cancel_fulfillment(fulfillment, staff_user, None, warehouse, get_plugins_manager())
     return fulfilled_order
 
 
@@ -2876,6 +2996,7 @@ def dummy_gateway_config():
 @pytest.fixture
 def dummy_payment_data(payment_dummy):
     return PaymentData(
+        gateway=payment_dummy.gateway,
         amount=Decimal(10),
         currency="USD",
         graphql_payment_id=graphene.Node.to_global_id("Payment", payment_dummy.pk),
@@ -2886,6 +3007,12 @@ def dummy_payment_data(payment_dummy):
         customer_ip_address=None,
         customer_email="example@test.com",
     )
+
+
+@pytest.fixture
+def dummy_webhook_app_payment_data(dummy_payment_data, payment_app):
+    dummy_payment_data.gateway = to_payment_app_id(payment_app, "credit-card")
+    return dummy_payment_data
 
 
 @pytest.fixture
@@ -3007,6 +3134,11 @@ def permission_manage_webhooks():
 @pytest.fixture
 def permission_manage_channels():
     return Permission.objects.get(codename="manage_channels")
+
+
+@pytest.fixture
+def permission_manage_payments():
+    return Permission.objects.get(codename="handle_payments")
 
 
 @pytest.fixture
@@ -3616,6 +3748,26 @@ def other_description_json():
 def app(db):
     app = App.objects.create(name="Sample app objects", is_active=True)
     app.tokens.create(name="Default")
+    return app
+
+
+@pytest.fixture
+def payment_app(db, permission_manage_payments):
+    app = App.objects.create(name="Payment App", is_active=True)
+    app.tokens.create(name="Default")
+    app.permissions.add(permission_manage_payments)
+
+    webhook = Webhook.objects.create(
+        name="payment-webhook-1",
+        app=app,
+        target_url="https://payment-gateway.com/api/",
+    )
+    webhook.events.bulk_create(
+        [
+            WebhookEvent(event_type=event_type, webhook=webhook)
+            for event_type in WebhookEventType.PAYMENT_EVENTS
+        ]
+    )
     return app
 
 
